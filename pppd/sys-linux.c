@@ -240,8 +240,6 @@ static int	if_is_up;	/* Interface has been marked up */
 static int	if6_is_up;	/* Interface has been marked up for IPv6, to help differentiate */
 static int	have_default_route;	/* Gateway for default route added */
 static int	have_default_route6;	/* Gateway for default IPv6 route added */
-static struct	rtentry old_def_rt;	/* Old default route */
-static int	default_rt_repl_rest;	/* replace and restore old default rt */
 static u_int32_t proxy_arp_addr;	/* Addr for proxy arp entry added */
 static char proxy_arp_dev[16];		/* Device for proxy arp entry */
 static u_int32_t our_old_addr;		/* for detecting address changes */
@@ -268,8 +266,6 @@ static int baud_rate_of (int speed);
 static void close_route_table (void);
 static int open_route_table (void);
 static int read_route_table (struct rtentry *rt);
-static int defaultroute_exists (struct rtentry *rt, int metric);
-static int defaultroute6_exists (struct in6_rtmsg *rt, int metric);
 static int get_ether_addr (u_int32_t ipaddr, struct sockaddr *hwaddr,
 			   char *name, int namelen);
 static void decode_version (char *buf, int *version, int *mod, int *patch);
@@ -2110,36 +2106,6 @@ static int read_route_table(struct rtentry *rt)
     return 1;
 }
 
-/********************************************************************
- *
- * defaultroute_exists - determine if there is a default route
- * with the given metric (or negative for any)
- */
-
-static int defaultroute_exists (struct rtentry *rt, int metric)
-{
-    int result = 0;
-
-    if (!open_route_table())
-	return 0;
-
-    while (read_route_table(rt) != 0) {
-	if ((rt->rt_flags & RTF_UP) == 0)
-	    continue;
-
-	if (kernel_version > KVERSION(2,1,0) && SIN_ADDR(rt->rt_genmask) != 0)
-	    continue;
-	if (SIN_ADDR(rt->rt_dst) == 0L && (metric < 0
-					   || rt->rt_metric == metric)) {
-	    result = 1;
-	    break;
-	}
-    }
-
-    close_route_table();
-    return result;
-}
-
 /*
  * have_route_to - determine if the system has any route to
  * a given IP address.  `addr' is in network byte order.
@@ -2171,18 +2137,11 @@ int have_route_to(u_int32_t addr)
 /********************************************************************
  *
  * sifdefaultroute - assign a default route through the address given.
- *
- * If the global default_rt_repl_rest flag is set, then this function
- * already replaced the original system defaultroute with some other
- * route and it should just replace the current defaultroute with
- * another one, without saving the current route. Use: demand mode,
- * when pppd sets first a defaultroute it it's temporary ppp0 addresses
- * and then changes the temporary addresses to the addresses for the real
- * ppp connection when it has come up.
  */
 
-int sifdefaultroute (int unit, u_int32_t ouraddr, u_int32_t gateway, bool replace)
+int sifdefaultroute (int unit, u_int32_t ouraddr, u_int32_t gateway)
 {
+<<<<<<< HEAD
     struct rtentry rt, tmp_rt;
     struct rtentry *del_rt = NULL;
 
@@ -2235,6 +2194,7 @@ int sifdefaultroute (int unit, u_int32_t ouraddr, u_int32_t gateway, bool replac
 	    }
 	}
     }
+    struct rtentry rt;
 
     memset (&rt, 0, sizeof (rt));
     SET_SA_FAMILY (rt.rt_dst, AF_INET);
@@ -2253,12 +2213,6 @@ int sifdefaultroute (int unit, u_int32_t ouraddr, u_int32_t gateway, bool replac
 	    error("default route ioctl(SIOCADDRT): %m");
 	return 0;
     }
-    if (default_rt_repl_rest && del_rt)
-	if (ioctl(sock_fd, SIOCDELRT, del_rt) < 0) {
-	    if ( ! ok_error ( errno ))
-		error("del old default route ioctl(SIOCDELRT): %m(%d)", errno);
-	    return 0;
-	}
 
     have_default_route = 1;
     return 1;
@@ -2297,164 +2251,19 @@ int cifdefaultroute (int unit, u_int32_t ouraddr, u_int32_t gateway)
 	    return 0;
 	}
     }
-    if (default_rt_repl_rest) {
-	notice("restoring old default route to %s [%I]",
-			old_def_rt.rt_dev, SIN_ADDR(old_def_rt.rt_gateway));
-	if (ioctl(sock_fd, SIOCADDRT, &old_def_rt) < 0) {
-	    if ( ! ok_error ( errno ))
-		error("restore default route ioctl(SIOCADDRT): %m(%d)", errno);
-	    return 0;
-	}
-	default_rt_repl_rest = 0;
-    }
 
     return 1;
 }
 
 #ifdef PPP_WITH_IPV6CP
-/*
- * /proc/net/ipv6_route parsing stuff.
- */
-static int route_dest_plen_col;
-static int open_route6_table (void);
-static int read_route6_table (struct in6_rtmsg *rt);
-
-/********************************************************************
- *
- * open_route6_table - open the interface to the route table
- */
-static int open_route6_table (void)
-{
-    char *path;
-
-    close_route_table();
-
-    path = path_to_procfs("/net/ipv6_route");
-    route_fd = fopen (path, "r");
-    if (route_fd == NULL) {
-	error("can't open routing table %s: %m", path);
-	return 0;
-    }
-
-    /* default to usual columns */
-    route_dest_col = 0;
-    route_dest_plen_col = 1;
-    route_gw_col = 4;
-    route_metric_col = 5;
-    route_flags_col = 8;
-    route_dev_col = 9;
-    route_num_cols = 10;
-
-    return 1;
-}
-
-/********************************************************************
- *
- * read_route6_table - read the next entry from the route table
- */
-
-static void hex_to_in6_addr(struct in6_addr *addr, const char *s)
-{
-    char hex8[9];
-    unsigned i;
-    uint32_t v;
-
-    hex8[8] = 0;
-    for (i = 0; i < 4; i++) {
-	memcpy(hex8, s + 8*i, 8);
-	v = strtoul(hex8, NULL, 16);
-	addr->s6_addr32[i] = v;
-    }
-}
-
-static int read_route6_table(struct in6_rtmsg *rt)
-{
-    char *cols[ROUTE_MAX_COLS], *p;
-    int col;
-
-    memset (rt, '\0', sizeof (struct in6_rtmsg));
-
-    if (fgets (route_buffer, sizeof (route_buffer), route_fd) == (char *) 0)
-	return 0;
-
-    p = route_buffer;
-    for (col = 0; col < route_num_cols; ++col) {
-	cols[col] = strtok(p, route_delims);
-	if (cols[col] == NULL)
-	    return 0;		/* didn't get enough columns */
-	p = NULL;
-    }
-
-    hex_to_in6_addr(&rt->rtmsg_dst, cols[route_dest_col]);
-    rt->rtmsg_dst_len = strtoul(cols[route_dest_plen_col], NULL, 16);
-    hex_to_in6_addr(&rt->rtmsg_gateway, cols[route_gw_col]);
-
-    rt->rtmsg_metric = strtoul(cols[route_metric_col], NULL, 16);
-    rt->rtmsg_flags = strtoul(cols[route_flags_col], NULL, 16);
-    rt->rtmsg_ifindex = if_nametoindex(cols[route_dev_col]);
-
-    return 1;
-}
-
-/********************************************************************
- *
- * defaultroute6_exists - determine if there is a default route
- */
-
-static int defaultroute6_exists (struct in6_rtmsg *rt, int metric)
-{
-    int result = 0;
-
-    if (!open_route6_table())
-	return 0;
-
-    while (read_route6_table(rt) != 0) {
-	if ((rt->rtmsg_flags & RTF_UP) == 0)
-	    continue;
-
-	if (rt->rtmsg_dst_len != 0)
-	    continue;
-	if (rt->rtmsg_dst.s6_addr32[0] == 0L
-	 && rt->rtmsg_dst.s6_addr32[1] == 0L
-	 && rt->rtmsg_dst.s6_addr32[2] == 0L
-	 && rt->rtmsg_dst.s6_addr32[3] == 0L
-	 && (metric < 0 || rt->rtmsg_metric == metric)) {
-	    result = 1;
-	    break;
-	}
-    }
-
-    close_route_table();
-    return result;
-}
-
 /********************************************************************
  *
  * sif6defaultroute - assign a default route through the address given.
- *
- * If the global default_rt_repl_rest flag is set, then this function
- * already replaced the original system defaultroute with some other
- * route and it should just replace the current defaultroute with
- * another one, without saving the current route. Use: demand mode,
- * when pppd sets first a defaultroute it it's temporary ppp0 addresses
- * and then changes the temporary addresses to the addresses for the real
- * ppp connection when it has come up.
  */
 
 int sif6defaultroute (int unit, eui64_t ouraddr, eui64_t gateway)
 {
     struct in6_rtmsg rt;
-    char buf[IF_NAMESIZE];
-
-    if (defaultroute6_exists(&rt, dfl_route_metric) &&
-	    rt.rtmsg_ifindex != if_nametoindex(ifname)) {
-	if (rt.rtmsg_flags & RTF_GATEWAY)
-	    error("not replacing existing default route via gateway");
-	else
-	    error("not replacing existing default route through %s",
-		  if_indextoname(rt.rtmsg_ifindex, buf));
-	return 0;
-    }
 
     memset (&rt, 0, sizeof (rt));
 
